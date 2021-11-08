@@ -34,6 +34,12 @@ import { WorkspaceAdapter } from '../../workspace-adapter';
 import { safeLoad } from 'js-yaml';
 import { DEVWORKSPACE_UPDATING_TIMESTAMP_ANNOTATION } from '../../devfileApi/devWorkspace/metadata';
 import { AxiosInstance } from 'axios';
+import { AppState } from '../../../store';
+import { IPatch } from '@eclipse-che/common/lib/dto/api';
+import { selectDwEditorsPluginsList } from '../../../store/Plugins/devWorkspacePlugins/selectors';
+import { isEqual } from 'lodash';
+import { FactorySource } from '../../../containers/FactoryLoader/updateDevfileMetadata';
+import { cloneObject } from '../../../store/helpers';
 
 export interface IStatusUpdate {
   error?: string;
@@ -247,22 +253,55 @@ export class DevWorkspaceClient extends WorkspaceClient {
     const createdWorkspace = await DwApi.createWorkspace(devworkspace);
     const namespace = createdWorkspace.metadata.namespace;
     const name = createdWorkspace.metadata.name;
-    const workspaceId = WorkspaceAdapter.getId(createdWorkspace);
 
+    const devWorkspaceTemplates = await this.devWorkspaceTemplate(
+      devfile,
+      createdWorkspace,
+      pluginsDevfile,
+      pluginRegistryUrl,
+      pluginRegistryInternalUrl,
+      optionalFilesContent,
+    );
+
+    await devWorkspaceTemplates.forEach(
+      async template => await DwtApi.createTemplate(<devfileApi.DevWorkspaceTemplate>template),
+    );
+
+    const patch = [
+      {
+        op: 'replace',
+        path: '/spec',
+        value: {
+          started: true,
+          routingClass: 'che',
+          template: createdWorkspace.spec.template,
+        },
+      },
+    ];
+    return DwApi.patchWorkspace(namespace, name, patch);
+  }
+
+  private async devWorkspaceTemplate(
+    devfile: devfileApi.Devfile,
+    devworkspace: devfileApi.DevWorkspace,
+    pluginsDevfile: devfileApi.Devfile[],
+    pluginRegistryUrl: string | undefined,
+    pluginRegistryInternalUrl: string | undefined,
+    optionalFilesContent: { [fileName: string]: string },
+  ): Promise<devfileApi.DevWorkspaceTemplateLike[]> {
+    const namespace = devworkspace.metadata.namespace;
+    //    const name = devworkspace.metadata.name;
+    const workspaceId = WorkspaceAdapter.getId(devworkspace);
     // do we have inline editor as part of the devfile ?
-    const inlineEditorYaml =
-      (devfile as any).attributes && (devfile as any).attributes['che-editor.yaml']
-        ? (safeLoad((devfile as any).attributes['che-editor.yaml']) as devfileApi.Devfile)
-        : undefined;
-
+    const inlineEditorYaml = devfile?.attributes?.['che-editor.yaml']
+      ? (safeLoad((devfile as any).attributes['che-editor.yaml']) as devfileApi.Devfile)
+      : undefined;
     const devfileGroupVersion = `${devWorkspaceApiGroup}/${devworkspaceVersion}`;
     const devWorkspaceTemplates: devfileApi.DevWorkspaceTemplateLike[] = [];
-
     // do we have a custom editor specified in the repository ?
     const cheEditorYaml = optionalFilesContent['.che/che-editor.yaml']
       ? (safeLoad(optionalFilesContent['.che/che-editor.yaml']) as devfileApi.Devfile)
       : undefined;
-
     const editorsDevfile: devfileApi.Devfile[] = [];
     // handle inlined editor in the devfile
     if (inlineEditorYaml) {
@@ -275,7 +314,6 @@ export class DevWorkspaceClient extends WorkspaceClient {
     } else {
       editorsDevfile.push(...pluginsDevfile);
     }
-
     for (const pluginDevfile of editorsDevfile) {
       if (!pluginDevfile || !pluginDevfile.metadata || !pluginDevfile.metadata.name) {
         throw new Error(
@@ -283,7 +321,6 @@ export class DevWorkspaceClient extends WorkspaceClient {
         );
       }
       const pluginName = this.normalizePluginName(pluginDevfile.metadata.name, workspaceId);
-
       const editorDWT = {
         kind: 'DevWorkspaceTemplate',
         apiVersion: devfileGroupVersion,
@@ -295,10 +332,9 @@ export class DevWorkspaceClient extends WorkspaceClient {
       };
       devWorkspaceTemplates.push(editorDWT);
     }
-
     const editorProcessContext: IDevWorkspaceEditorProcessingContext = {
       devfile,
-      devWorkspace: createdWorkspace,
+      devWorkspace: devworkspace,
       workspaceId,
       devWorkspaceTemplates,
       editorsDevfile,
@@ -306,29 +342,24 @@ export class DevWorkspaceClient extends WorkspaceClient {
       axios: this.axios,
       optionalFilesContent,
     };
-
     // if editors have some specific enhancements
     await this.applySpecificEditors(editorProcessContext);
-
     await Promise.all(
       devWorkspaceTemplates.map(async template => {
         if (!template.metadata) {
           template.metadata = {};
         }
-
         // Update the namespace
         template.metadata.namespace = namespace;
-
         // Update owner reference (to allow automatic cleanup)
         template.metadata.ownerReferences = [
           {
             apiVersion: devfileGroupVersion,
             kind: devworkspaceSingularSubresource,
-            name: createdWorkspace.metadata.name,
-            uid: createdWorkspace.metadata.uid,
+            name: devworkspace.metadata.name,
+            uid: devworkspace.metadata.uid,
           },
         ];
-
         // propagate the plugin registry and dashboard urls to the containers in the initial devworkspace templates
         if (template.spec?.components) {
           for (const component of template.spec?.components) {
@@ -338,39 +369,27 @@ export class DevWorkspaceClient extends WorkspaceClient {
                 container.env = [];
               }
               container.env.push(
-                ...[
-                  {
-                    name: this.dashboardUrlEnvName,
-                    value: window.location.origin,
-                  },
-                  {
-                    name: this.pluginRegistryUrlEnvName,
-                    value: pluginRegistryUrl || '',
-                  },
-                  {
-                    name: this.pluginRegistryInternalUrlEnvName,
-                    value: pluginRegistryInternalUrl || '',
-                  },
-                ],
+                {
+                  name: this.dashboardUrlEnvName,
+                  value: window.location.origin,
+                },
+                {
+                  name: this.pluginRegistryUrlEnvName,
+                  value: pluginRegistryUrl || '',
+                },
+                {
+                  name: this.pluginRegistryInternalUrlEnvName,
+                  value: pluginRegistryInternalUrl || '',
+                },
               );
             }
           }
         }
-
-        const pluginDWT = await DwtApi.createTemplate(<devfileApi.DevWorkspaceTemplate>template);
-        this.addPlugin(createdWorkspace, pluginDWT.metadata.name, pluginDWT.metadata.namespace);
+        this.addPlugin(devworkspace, template.metadata.name!, template.metadata.namespace);
       }),
     );
 
-    createdWorkspace.spec.started = true;
-    const patch = [
-      {
-        op: 'replace',
-        path: '/spec',
-        value: createdWorkspace.spec,
-      },
-    ];
-    return DwApi.patchWorkspace(namespace, name, patch);
+    return devWorkspaceTemplates;
   }
 
   // Stuff to do for some editors
@@ -725,17 +744,69 @@ export class DevWorkspaceClient extends WorkspaceClient {
     }
   }
 
-  upgradeDevWorkspaceTemplate(devworkspace: devfileApi.DevWorkspace): api.IPatch {
-    const {
-      spec: { template },
-    } = devworkspace;
+  async updateDevWorkspaceTemplate(
+    workspace: devfileApi.DevWorkspace,
+    getState: () => AppState,
+    requestFactoryResolver: (location: string) => Promise<void>,
+    requestDwEditor: (cheEditor: string) => Promise<void>,
+  ): Promise<devfileApi.DevWorkspace> {
+    const source = workspace.metadata.annotations?.['che.eclipse.org/devfile-source'];
+    if (!source) {
+      return workspace;
+    }
+    const sourceObj = safeLoad(source) as Partial<FactorySource>;
+    if (typeof sourceObj !== 'object') {
+      return workspace;
+    }
+    const search = sourceObj.factory?.params;
+    if (!search) {
+      return workspace;
+    }
+    const searchParam = new window.URLSearchParams(search);
+    const location = searchParam.get('url');
+    if (!location) {
+      return workspace;
+    }
+    await requestFactoryResolver(location);
+    const state = getState();
+    const { devfile, optionalFilesContent } = state.factoryResolver.resolver;
+    const attrs: { [key: string]: string } = {};
+    searchParam.forEach((val: string, key: string) => {
+      if (key !== 'url') {
+        attrs[key] = val;
+      }
+    });
+    let cheEditor: string | undefined = attrs?.['che-editor'];
+    if (cheEditor) {
+      if (cheEditor !== state.dwPlugins.defaultEditorName) {
+        await requestDwEditor(cheEditor);
+      }
+    } else {
+      cheEditor = state.dwPlugins.defaultEditorName;
+    }
+    const dwEditorsPluginsList = selectDwEditorsPluginsList(cheEditor)(state);
+    const pluginRegistryUrl = state.workspacesSettings.settings['cheWorkspacePluginRegistryUrl'];
+    const pluginRegistryInternalUrl =
+      state.workspacesSettings.settings['cheWorkspacePluginRegistryInternalUrl'];
+    const existingTemplate = cloneObject(workspace.spec.template);
+    await this.devWorkspaceTemplate(
+      devfile,
+      workspace,
+      dwEditorsPluginsList,
+      pluginRegistryUrl,
+      pluginRegistryInternalUrl,
+      optionalFilesContent || {},
+    );
+    if (isEqual(existingTemplate, workspace.spec.template)) {
+      return workspace;
+    }
 
-    const patch = {
-      op: 'replace',
-      path: '/spec/template',
-      value: template,
-    };
-
-    return patch;
+    return await DwApi.patchWorkspace(workspace.metadata.namespace, workspace.metadata.name, [
+      {
+        op: 'replace',
+        path: '/spec/template',
+        value: workspace.spec.template,
+      },
+    ]);
   }
 }

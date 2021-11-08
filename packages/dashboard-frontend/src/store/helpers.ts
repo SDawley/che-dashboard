@@ -26,3 +26,10 @@
 export function createObject<T>(target: T, source: Partial<T>): T {
   return Object.assign({}, target, source);
 }
+
+export function cloneObject<T>(obj: T): T {
+  if (typeof obj === 'object') {
+    return JSON.parse(JSON.stringify(obj));
+  }
+  return obj;
+}

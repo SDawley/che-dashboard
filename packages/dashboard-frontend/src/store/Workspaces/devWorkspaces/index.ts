@@ -32,6 +32,7 @@ import { devWorkspaceKind } from '../../../services/devfileApi/devWorkspace';
 import { WorkspaceAdapter } from '../../../services/workspace-adapter';
 import { DEVWORKSPACE_UPDATING_TIMESTAMP_ANNOTATION } from '../../../services/devfileApi/devWorkspace/metadata';
 import * as DwPluginsStore from '../../Plugins/devWorkspacePlugins';
+import * as FactoryResolver from '../../FactoryResolver';
 const cheWorkspaceClient = container.get(CheWorkspaceClient);
 const devWorkspaceClient = container.get(DevWorkspaceClient);
 
@@ -248,12 +249,13 @@ export const actionCreators: ActionCreators = {
     ): AppThunk<KnownAction, Promise<void>> =>
     async (dispatch, getState): Promise<void> => {
       dispatch({ type: 'REQUEST_DEVWORKSPACE' });
+      const state = getState();
+      const settings = state.workspacesSettings.settings;
       try {
         await devWorkspaceClient.updateDebugMode(workspace, debugWorkspace);
         let updatedWorkspace: devfileApi.DevWorkspace;
         if (workspace.metadata.annotations?.[DEVWORKSPACE_NEXT_START_ANNOTATION]) {
           // If the workspace has DEVWORKSPACE_NEXT_START_ANNOTATION then update the devworkspace with the DEVWORKSPACE_NEXT_START_ANNOTATION annotation value and then start the devworkspace
-          const state = getState();
           const plugins = selectDwEditorsPluginsList(state.dwPlugins.defaultEditorName)(state);
 
           const storedDevWorkspace = JSON.parse(
@@ -274,6 +276,19 @@ export const actionCreators: ActionCreators = {
           workspace.spec.started = true;
           updatedWorkspace = await devWorkspaceClient.update(workspace, plugins);
         } else {
+          try {
+            workspace = await devWorkspaceClient.updateDevWorkspaceTemplate(
+              workspace,
+              getState,
+              location => dispatch(FactoryResolver.actionCreators.requestFactoryResolver(location)),
+              cheEditor =>
+                dispatch(DwPluginsStore.actionCreators.requestDwEditor(settings, cheEditor)),
+            );
+          } catch (e) {
+            console.debug(
+              `Failed to update workspace editor, reason: ${common.helpers.errors.getMessage(e)}`,
+            );
+          }
           updatedWorkspace = await devWorkspaceClient.changeWorkspaceStatus(workspace, true);
         }
         dispatch({
